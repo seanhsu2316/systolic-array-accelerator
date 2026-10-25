@@ -1,0 +1,32 @@
+# make_features.py — 把每段 200×3 = 600 個數字，濃縮成 12 個「特徵」
+# 放法：放在 make_windows.py 旁邊（要先跑過 make_windows.py，產生 windows.npz）
+# TODO：只要完成標 TODO 的三行，其他不用改。
+
+import numpy as np
+
+d = np.load("windows.npz")
+X = d["X"]          # 形狀：(310, 200, 3)  → 310 段、每段 200 筆、x/y/z 三軸
+y = d["y"]          # 形狀：(310,)         → 每段的答案 0=走 1=跑 2=跳
+
+# axis=1 的意思：沿著「200 筆時間」那個方向算，每段、每軸各得到一個數字
+mean = np.mean(X, axis=1)     # 平均值：手機平常朝哪個方向（重力）  形狀 (310, 3)
+
+# TODO：仿照上面那一行，寫出下面三個
+std  = np.std(X,  axis=1)                   # 標準差：晃得多劇烈        提示：np.std
+mx   = np.max(X,  axis=1)                    # 最大值：最用力的那一下    提示：np.max
+mn   = np.min(X,  axis=1)                    # 最小值：往反方向最用力的那一下  提示：np.min
+
+F = np.concatenate([mean, std, mx, mn], axis=1)   # 左右拼起來 → (310, 12)
+print("特徵 F 的形狀:", F.shape)
+
+# 看看三種動作的 std 平均差多少（每一列是一種動作）
+names = ["walk", "run ", "jump"]
+np.set_printoptions(precision=2, suppress=True)
+print("\n各動作的平均晃動程度 (std)：  x軸    y軸    z軸")
+for k in range(3):
+    rows = F[y == k]                      # 只挑出答案是 k 的那些段
+    avg = rows.mean(axis=0)               # 12 個特徵各自平均
+    print(names[k], "  ", avg[3:6])
+
+np.savez("features.npz", F=F, y=y)
+print("\n存成 features.npz")
