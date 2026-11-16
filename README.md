@@ -7,6 +7,7 @@ It runs a small INT8 model that recognizes motion (walk / run / jump) from phone
 
 - 4×4 array is bit-exact with NumPy on 100 random INT8 matrix multiplications
 - Motion-recognition inference runs on the RTL array: hardware scores bit-exact with NumPy, **63 / 63** held-out windows correct
+- Cross-day test on a new recording: accuracy fell to 40%; after fixing the features and the data it reached **96.4%**, and the array again matches NumPy exactly (**80 / 83**)
 - Synthesized with Yosys 0.70: **~14.4K generic cells**, including 768 flip-flops
 
 ## Why I built this
@@ -63,6 +64,26 @@ Bias is kept in INT32 to match the accumulator. INT8 predictions match the float
 - The 12 features do not need to be split: because the array is output-stationary, each PE keeps accumulating, so all 12 values are streamed through in one pass (K = 12 > N = 4).
 - Each group takes K + 2N = 20 cycles to stream in and drain.
 
+## Cross-day validation
+
+The 63 / 63 result used test windows from the same session as the training data, so I recorded walking, running and jumping again on a different day and tested the trained model on it without retraining.
+
+| Step | Test data | Accuracy |
+|---|---|---|
+| Original 12-feature model | New day, all 165 windows | 40.0% |
+| 4 orientation-free features, trained on day 1 only | New day, all 165 windows | 64.8% |
+| Same features, trained on day 1 + first half of day 2 | Second half of day 2, 83 windows | 96.4% |
+| INT8 model on the 4×4 RTL array | Same 83 windows | 80 / 83, bit-exact with NumPy |
+
+**What went wrong.** The confusion matrix showed the model calling almost everything "walk". Comparing per-axis means showed why: the phone sat in my pocket at a different angle, so gravity moved from the x axis to the y axis. The model had learned "large shaking on x means run or jump", and on the new day that shaking was on y.
+The per-axis means also differed between classes in the original recordings, which suggests the first model partly learned the phone's angle instead of the motion (shortcut learning).
+
+**Fix 1: features that don't depend on orientation.** Instead of x, y and z separately, each sample is reduced to its magnitude `|a| = sqrt(x² + y² + z²)`, which stays the same however the phone is turned. Each window then has 4 features: mean, std, max and min of `|a|`. This raised the new-day accuracy to 64.8%.
+
+**Fix 2: more varied data.** The remaining errors were running windows predicted as jumping. On the second day I ran harder (std of `|a|` 8.6 vs. 6.5 on day 1), which put running between the day-1 run and jump clusters. Adding the first half of the day-2 recording to the training set (with a gap, split by time) brought the second half to 96.4%.
+
+**Back on the hardware.** The new model is quantized the same way (INT8 weights and features, INT32 bias). With K = 4 features instead of 12, the 83 test windows are padded to 84 and run in 21 groups of 4, and each group takes K + 2N = 12 cycles instead of 20. The RTL didn't change, only the testbench parameters.
+
 ## Synthesis
 
 Yosys 0.70, generic gate library (`synth -top systolic_array; stat`):
@@ -95,6 +116,12 @@ These are generic Yosys cells, not a standard-cell area; the count changes with 
 | `python/quantize.py` | INT8 quantization and accuracy check |
 | `python/make_hw_vectors.py` | Write the INT8 model and test windows as .hex for the array |
 | `tb/tb_infer.v` | Runs the motion model on the 4×4 array and checks against NumPy |
+| `python/test_new.py` | Tests the original model on the day-2 recording (40%) |
+| `python/train_mag.py` | Orientation-free magnitude features; trains on day 1 and day 1 + half of day 2 |
+| `python/quantize_mag.py` | INT8 quantization of the magnitude model |
+| `python/make_hw_vectors_mag.py` | Writes the magnitude model and day-2 test windows as .hex |
+| `tb/tb_infer_mag.v` | Runs the magnitude model on the 4×4 array (83 windows) |
+| `python/data/` | phyphox recordings: `walk/run/jump.csv` (day 1) and `*_new.csv` (day 2) |
 
 ## Verification
 
@@ -106,6 +133,7 @@ These are generic Yosys cells, not a standard-cell area; the count changes with 
 | 4×4 array | 201 matrix multiplications | ✅ PASS |
 | 4×4 array vs. NumPy | 100 random INT8 matrices | ✅ PASS |
 | Motion model on 4×4 array | 63 test windows, scores vs. NumPy | ✅ PASS, 63 / 63 correct |
+| Magnitude model on 4×4 array | 83 day-2 test windows, scores vs. NumPy | ✅ PASS, 80 / 83 correct |
 
 **Golden-model flow:**
 
@@ -130,7 +158,7 @@ vvp sim
 # Expected: PASS: 100 tests match NumPy golden model
 ```
 
-**Motion-recognition demo** (put `walk.csv`, `run.csv`, `jump.csv` from phyphox in `python/data/`):
+**Motion-recognition demo** (recordings are in `python/data/`):
 
 ```bash
 cd python
@@ -148,15 +176,33 @@ vvp sim
 #           hardware accuracy: 63 / 63
 ```
 
+**Cross-day demo:**
+
+```bash
+cd python
+python test_new.py              # original model on day 2: 40.0%
+python train_mag.py             # 64.8%, then 96.4%; saves model_mag.npz
+python quantize_mag.py
+python make_hw_vectors_mag.py
+mv *.hex ..
+cd ..
+
+iverilog -g2012 -o sim rtl/mac.v rtl/pe.v rtl/systolic_array.v tb/tb_infer_mag.v
+vvp sim
+# Expected: PASS: all hardware scores match NumPy
+#           hardware accuracy: 80 / 83
+```
+
 ## What I learned
 
 - **Software and hardware can check each other.** I didn't expect Python and Verilog to work together. Using NumPy as an independent "examiner" taught me why verification needs a reference model that is separate from the design itself: if the testbench computes the answer the same way the circuit does, both can be wrong and the test still passes.
 - **Thinking in grids of wires.** It took me a while to understand how data moves through the array when it is built with `generate` loops. What made it click was naming the wires as a table, `a_wire[i][j]` and `b_wire[i][j]`: the output of one PE is the same wire as the input of its neighbor, so connecting 16 PEs comes down to one rule.
+- **A high score on easy data can hide a broken model.** The first model scored 100% on test windows from the same day and 40% on a new day. The confusion matrix and a comparison of feature averages pointed to the cause, the phone's orientation, and choosing features that don't depend on it fixed most of the gap. Testing on data recorded separately is the only way I found to see this.
 - **An AI model is mostly multiplication.** Before this project, "AI" and "hardware" felt like separate topics. Training the motion model showed me that the whole model is one matrix multiplication, `F @ W + b`, which is exactly what my array computes. Synthesis then showed where the cost is: the multipliers take most of the area, which is why quantizing to INT8 matters so much for AI hardware.
 
 ## Limitations
 
-- The data comes from one person in one session, so 63 / 63 is on easy data. A recording from a different day would be a fairer test.
+- All recordings come from one person on two days with the phone in the same pocket. The 96.4% result uses half of day 2 for training, so a third day (or another person) would be the next fair test.
 - Everything runs in simulation (Icarus Verilog / EDA Playground); nothing has been run on an FPGA yet.
 
 ## Roadmap
@@ -168,5 +214,5 @@ vvp sim
 - [x] Train a small motion-recognition model on phone sensor data (phyphox)
 - [x] Quantize weights to INT8 and run inference on the array
 - [x] Synthesize with Yosys and report area
-- [ ] Test on new recordings from a different day
+- [x] Test on new recordings from a different day, and fix the features (40% → 96.4%)
 - [ ] Run on an FPGA
