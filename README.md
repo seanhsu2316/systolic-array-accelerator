@@ -121,6 +121,8 @@ These are generic Yosys cells, not a standard-cell area; the count changes with 
 | `python/quantize_mag.py` | INT8 quantization of the magnitude model |
 | `python/make_hw_vectors_mag.py` | Writes the magnitude model and day-2 test windows as .hex |
 | `tb/tb_infer_mag.v` | Runs the magnitude model on the 4×4 array (83 windows) |
+| `tb/tb_mac.sv` | SystemVerilog MAC testbench: constrained-random stimulus, reference model, assertions |
+| `tb/tb_array.sv` | SystemVerilog 4×4 array testbench: generates random matrices and checks every element with `assert` |
 | `python/data/` | phyphox recordings: `walk/run/jump.csv` (day 1) and `*_new.csv` (day 2) |
 
 ## Verification
@@ -134,6 +136,11 @@ These are generic Yosys cells, not a standard-cell area; the count changes with 
 | 4×4 array vs. NumPy | 100 random INT8 matrices | ✅ PASS |
 | Motion model on 4×4 array | 63 test windows, scores vs. NumPy | ✅ PASS, 63 / 63 correct |
 | Magnitude model on 4×4 array | 83 day-2 test windows, scores vs. NumPy | ✅ PASS, 80 / 83 correct |
+| MAC (SystemVerilog) | 1,001 constrained-random checks with assertions | ✅ PASS |
+| 4×4 array (SystemVerilog) | 500 random matrix multiplications, self-contained reference model | ✅ PASS |
+
+**SystemVerilog testbenches.** `tb_mac.sv` and `tb_array.sv` generate their own random stimulus (`$urandom_range` controls how often reset and enable occur), compute the expected result inside the testbench, and check it with immediate assertions, so no Python or .hex files are needed.
+To make sure the testbench actually catches bugs, I broke the MAC on purpose: removing the `else` before `if (en)` makes reset lose priority when `rst` and `en` are both high. The assertions flagged it in 855 of 1,001 checks, even though the reset line was still in the code.
 
 **Golden-model flow:**
 
@@ -193,6 +200,15 @@ vvp sim
 #           hardware accuracy: 80 / 83
 ```
 
+**SystemVerilog testbenches:**
+
+```bash
+iverilog -g2012 -o sim rtl/mac.v tb/tb_mac.sv && vvp sim
+# Expected: PASS: 1001 checks, all correct
+iverilog -g2012 -o sim rtl/mac.v rtl/pe.v rtl/systolic_array.v tb/tb_array.sv && vvp sim
+# Expected: PASS: 500 random matrix multiplications
+```
+
 ## What I learned
 
 - **Software and hardware can check each other.** I didn't expect Python and Verilog to work together. Using NumPy as an independent "examiner" taught me why verification needs a reference model that is separate from the design itself: if the testbench computes the answer the same way the circuit does, both can be wrong and the test still passes.
@@ -215,4 +231,6 @@ vvp sim
 - [x] Quantize weights to INT8 and run inference on the array
 - [x] Synthesize with Yosys and report area
 - [x] Test on new recordings from a different day, and fix the features (40% → 96.4%)
+- [x] SystemVerilog self-checking testbenches with assertions
+- [ ] Functional coverage and class-based stimulus (UVM basics)
 - [ ] Run on an FPGA
